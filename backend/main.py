@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from groq import Groq
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
@@ -14,19 +15,30 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 CONTEXT_FILE = BASE_DIR / "context" / "power_electronics_context.md"
 
-# Load .env
+# Load environment variables from the project root .env file
 load_dotenv(BASE_DIR / ".env")
 
-MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "local").strip().lower()
+# LLM provider configuration
+# Set MODEL_PROVIDER=groq in .env to use Groq.
+MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "groq").strip().lower()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip()
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini").strip()
 
 HF_MODEL_ID = os.getenv("HF_MODEL_ID", "google/gemma-3-1b-it").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "10000"))
 
-# OpenAI client is optional.
+# Initialize API clients only when their API keys are configured.
+groq_client = None
+if GROQ_API_KEY and not GROQ_API_KEY.startswith("PASTE_"):
+    groq_client = Groq(api_key=GROQ_API_KEY)
+
 openai_client = None
 if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("PASTE_"):
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
@@ -35,11 +47,10 @@ if OPENAI_API_KEY and not OPENAI_API_KEY.startswith("PASTE_"):
 local_tokenizer = None
 local_model = None
 
-
 app = FastAPI(
     title="AI Teaching Agent - Power Electronics",
-    version="2.0.0",
-    description="Teaching agent with OpenAI or local Hugging Face Gemma support.",
+    version="2.1.0",
+    description="Power Electronics teaching agent with Groq, OpenAI, or local Hugging Face support.",
 )
 
 app.add_middleware(
@@ -126,13 +137,33 @@ def build_messages(request: ChatRequest, instructions: str) -> list[dict]:
     return messages
 
 
+def generate_with_groq(messages: list[dict]) -> str:
+    """Generate an answer using the Groq chat-completions API."""
+    if groq_client is None:
+        raise RuntimeError(
+            "Groq is selected, but GROQ_API_KEY is not configured in the project .env file."
+        )
+
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        max_completion_tokens=1200,
+    )
+
+    answer = response.choices[0].message.content
+    if not answer or not answer.strip():
+        raise RuntimeError("Groq returned an empty response.")
+
+    return answer.strip()
+
+
 def generate_with_openai(messages: list[dict]) -> str:
+    """Generate an answer using the OpenAI Responses API."""
     if openai_client is None:
         raise RuntimeError(
             "OpenAI is selected, but OPENAI_API_KEY is not configured in .env."
         )
 
-    # Separate system instruction from conversation for the Responses API.
     instructions = messages[0]["content"]
     conversation = messages[1:]
 
@@ -147,6 +178,7 @@ def generate_with_openai(messages: list[dict]) -> str:
 
 
 def load_local_gemma():
+    """Load the local Hugging Face Gemma model only when it is needed."""
     global local_tokenizer, local_model
 
     if local_model is not None and local_tokenizer is not None:
@@ -160,7 +192,6 @@ def load_local_gemma():
             "Local Gemma dependencies are missing. Run: pip install -r requirements.txt"
         ) from exc
 
-    # Pass HF_TOKEN when it is explicitly configured.
     token = None if (not HF_TOKEN or HF_TOKEN.startswith("PASTE_")) else HF_TOKEN
 
     local_tokenizer = AutoTokenizer.from_pretrained(
@@ -173,11 +204,15 @@ def load_local_gemma():
             HF_MODEL_ID,
             token=token,
             device_map="auto",
-            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            torch_dtype=(
+                torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16
+            ),
             attn_implementation="sdpa",
         )
     else:
-        # CPU fallback. It is slower, but works on a normal laptop.
+        # CPU fallback. It can be slow and may require substantial RAM.
         local_model = AutoModelForCausalLM.from_pretrained(
             HF_MODEL_ID,
             token=token,
@@ -191,11 +226,11 @@ def load_local_gemma():
 
 
 def generate_with_local_gemma(messages: list[dict]) -> str:
+    """Generate an answer using a locally loaded Hugging Face Gemma model."""
     import torch
 
     tokenizer, model = load_local_gemma()
 
-    # Extract system instructions separately.
     system_parts = []
     conversation = []
 
@@ -208,14 +243,15 @@ def generate_with_local_gemma(messages: list[dict]) -> str:
 
         if role == "system":
             system_parts.append(content)
-
         elif role in ("user", "assistant"):
-            conversation.append({
-                "role": role,
-                "content": content,
-            })
+            conversation.append(
+                {
+                    "role": role,
+                    "content": content,
+                }
+            )
 
-    # Combine the system instructions with the first user message.
+    # Put system instructions into the first user message for Gemma.
     system_text = "\n\n".join(system_parts)
 
     if conversation and conversation[0]["role"] == "user":
@@ -225,14 +261,16 @@ def generate_with_local_gemma(messages: list[dict]) -> str:
             else conversation[0]["content"]
         )
     elif system_text:
-        conversation.insert(0, {
-            "role": "user",
-            "content": system_text,
-        })
+        conversation.insert(
+            0,
+            {
+                "role": "user",
+                "content": system_text,
+            },
+        )
 
     # Merge consecutive messages with the same role.
     normalized = []
-
     for msg in conversation:
         if normalized and normalized[-1]["role"] == msg["role"]:
             if msg["role"] == "user":
@@ -249,7 +287,6 @@ def generate_with_local_gemma(messages: list[dict]) -> str:
     if not normalized:
         raise ValueError("No valid user message was provided to Gemma.")
 
-    # Apply Gemma's chat template.
     inputs = tokenizer.apply_chat_template(
         normalized,
         tokenize=True,
@@ -293,41 +330,43 @@ def generate_answer(request: ChatRequest) -> tuple[str, str]:
         mode=request.mode,
         difficulty=request.difficulty,
     )
-
     messages = build_messages(request, instructions)
 
-    if MODEL_PROVIDER == "local":
-        answer = generate_with_local_gemma(messages)
-        return answer, f"local:{HF_MODEL_ID}"
+    if MODEL_PROVIDER == "groq":
+        return generate_with_groq(messages), f"groq:{GROQ_MODEL}"
 
     if MODEL_PROVIDER == "openai":
-        answer = generate_with_openai(messages)
-        return answer, f"openai:{OPENAI_MODEL}"
+        return generate_with_openai(messages), f"openai:{OPENAI_MODEL}"
+
+    if MODEL_PROVIDER == "local":
+        return generate_with_local_gemma(messages), f"local:{HF_MODEL_ID}"
 
     raise RuntimeError(
-        "Invalid MODEL_PROVIDER in .env. "
-        "Use MODEL_PROVIDER=local or MODEL_PROVIDER=openai."
+        f"Invalid MODEL_PROVIDER: {MODEL_PROVIDER}. "
+        "Use MODEL_PROVIDER=groq, MODEL_PROVIDER=openai, or MODEL_PROVIDER=local."
     )
 
 
 @app.get("/api/health")
 def health():
-    configured = (
-        MODEL_PROVIDER == "local"
-        or (
-            MODEL_PROVIDER == "openai"
-            and openai_client is not None
-        )
-    )
+    if MODEL_PROVIDER == "groq":
+        configured = groq_client is not None
+        model_name = GROQ_MODEL
+    elif MODEL_PROVIDER == "openai":
+        configured = openai_client is not None
+        model_name = OPENAI_MODEL
+    elif MODEL_PROVIDER == "local":
+        # The local model is loaded lazily when the first chat request arrives.
+        configured = True
+        model_name = HF_MODEL_ID
+    else:
+        configured = False
+        model_name = "unknown"
 
     return {
         "status": "ok",
         "provider": MODEL_PROVIDER,
-        "model": (
-            HF_MODEL_ID
-            if MODEL_PROVIDER == "local"
-            else OPENAI_MODEL
-        ),
+        "model": model_name,
         "llm_configured": configured,
         "context_loaded": CONTEXT_FILE.exists(),
         "local_model_loaded": local_model is not None,
@@ -349,12 +388,11 @@ def chat(request: ChatRequest):
             "provider": MODEL_PROVIDER,
             "model": model_name,
         }
-
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"LLM request failed: {type(exc).__name__}: {exc}",
-        )
+        ) from exc
 
 
 @app.get("/")
@@ -367,4 +405,5 @@ app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host=HOST, port=PORT)
